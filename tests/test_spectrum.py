@@ -37,6 +37,61 @@ def test_chain_detection_uses_server_features_genesis_hash():
     assert spectrum.chain == "main"
     assert spectrum.roothash == "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
 
+
+def test_chain_hint_does_not_prevent_detection():
+    spectrum = Spectrum.__new__(Spectrum)
+    spectrum.roothash = ""
+    spectrum.chain = "main"  # operator hint
+    spectrum._chain_detection_lock = threading.Lock()
+    spectrum._last_chain_detection_attempt_ts = 0.0
+
+    sock = MagicMock()
+    sock.status = "ok"
+
+    def fake_call(method, params=None):
+        if method == "server.features":
+            return {
+                "genesis_hash": "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
+            }
+        raise AssertionError(f"Unexpected electrum call: {method}")
+
+    sock.call = fake_call
+    spectrum.sock = sock
+
+    spectrum._maybe_detect_chain(force=True)
+    assert spectrum.chain == "test"
+
+
+def test_chain_detection_retries_if_regtest_is_only_fallback():
+    spectrum = Spectrum.__new__(Spectrum)
+    # Simulate a previous failed/unknown detection that left us on the default
+    spectrum.roothash = "deadbeef" * 8
+    spectrum.chain = "regtest"
+    spectrum._chain_detection_lock = threading.Lock()
+    spectrum._last_chain_detection_attempt_ts = 0.0
+
+    sock = MagicMock()
+    sock.status = "ok"
+
+    def fake_call(method, params=None):
+        if method == "server.features":
+            return {
+                "genesis_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+            }
+        raise AssertionError(f"Unexpected electrum call: {method}")
+
+    sock.call = fake_call
+    spectrum.sock = sock
+
+    spectrum._maybe_detect_chain(force=False)
+    assert spectrum.chain == "main"
+
+
+def test_chain_hint_parsed_from_node_json(tmp_path):
+    node_json = tmp_path / "spectrum_node.json"
+    node_json.write_text('{"host":"127.0.0.1","port":50001,"ssl":false,"network":"main"}', encoding="utf-8")
+    assert Spectrum._chain_hint_from_node_json(str(node_json)) == "main"
+
 def test_importdescriptor(app: Flask, rootkey_hold_accident, acc0key0addr_hold_accident):
     ''' THis does:
         * Creating a wallet
