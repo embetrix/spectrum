@@ -7,6 +7,7 @@ import pytest
 from cryptoadvance.spectrum.elsock import ElectrumSocket, ElSockTimeoutException
 import hashlib
 import struct
+import threading
 
 from cryptoadvance.spectrum.util import SpectrumException
 
@@ -72,3 +73,30 @@ def test_elsock_thread_status():
     assert es.thread_status["not_all_alive"] == False
     assert es.thread_status["alive"] == ["recv", "write", "ping", "notify"]
     assert es.thread_status["not_alive"] == []
+
+
+def test_recv_loop_exits_on_peer_close_without_newline():
+    class FakeSocket:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+
+        def recv(self, n):
+            if self._chunks:
+                return self._chunks.pop(0)
+            return b""
+
+        def fileno(self):
+            return 1
+
+    es = ElectrumSocket.__new__(ElectrumSocket)
+    es.running = True
+    es.sleep_recv_loop = 0
+    es._socket = FakeSocket([b"{\"jsonrpc\":\"2.0\"", b""])
+    es._notifications = []
+    es._results = {}
+
+    thread = threading.Thread(target=es.recv_loop, daemon=True)
+    thread.start()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive(), "recv_loop should exit when socket closes"

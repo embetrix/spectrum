@@ -449,34 +449,43 @@ class ElectrumSocket:
         None
         """
         sleep = self.sleep_recv_loop  # This probably heavily impacts the sync-time
+        buffer = b""
         read_counter = 0
         timeout_counter = 0
         while self.running:
             try:
                 data = self._socket.recv(2048)
                 read_counter += 1
-            except TimeoutError:
-                pass
-                # This might happen quite often as we're using a non-blocking socket here.
-                # And if no data is there to read from and the timeout is reached, we'll
-                # get this error. However it's not a real error-condition (imho)
+            except (socket.timeout, TimeoutError, BlockingIOError):
+                # Not an error condition: just no data available.
+                timeout_counter += 1
+                time.sleep(sleep)
+                continue
+            except OSError as e:
+                logger.error(f"Error in recv-loop: {e.__class__.__name__}: {e}")
+                return
 
-                # As i'm not 100% sure about that stuff, i'll keep that code around to uncomment any time:
-                # timeout_counter += 1
-                # logger.error(
-                #     f"Timeout in recv-loop, happens in {timeout_counter}/{read_counter} * 100 = {timeout_counter/read_counter * 100 }% of all reads. "
-                # )
-                # logger.error(f"consider to increase socket_timeout which is currently {self._socket_timeout}")
-            while not data.endswith(b"\n"):  # b"\n" is the end of the message
-                if not self.running:
-                    break
-                data += self._socket.recv(2048)
-            # data looks like this:
-            # b'{"jsonrpc": "2.0", "result": {"hex": "...", "height": 761086}, "id": 2210736436}\n'
-            arr = [json.loads(d.decode()) for d in data.strip().split(b"\n") if d]
-            # arr looks like this
-            # [{'jsonrpc': '2.0', 'result': {'hex': '...', 'height': 761086}, 'id': 2210736436}]
-            for response in arr:
+            # Peer closed the connection.
+            if not data:
+                logger.info("Socket closed by peer in recv-loop")
+                return
+
+            buffer += data
+            # Safety belt: if the server stops sending newlines, don't grow without bound.
+            if len(buffer) > 1024 * 1024:
+                logger.error("recv-loop buffer exceeded 1MiB without newline; treating as broken socket")
+                return
+
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                if not line:
+                    continue
+                try:
+                    response = json.loads(line.decode())
+                except Exception as e:
+                    logger.error(f"Error decoding JSON from electrum server: {e}")
+                    continue
+
                 if "method" in response:  # notification
                     self._notifications.append(response)
                 if "id" in response:  # request
@@ -495,14 +504,12 @@ class ElectrumSocket:
         None
         """
         tries = 0
-        ts = self.ping()
         while self.running:
-            time.sleep(self.sleep_ping_loop)
             try:
                 self.ping()
                 tries = 0
-            except ElSockTimeoutException as e:
-                tries = tries + 1
+            except ElSockTimeoutException:
+                tries += 1
                 logger.error(
                     f"Timeout in ping-loop ({tries}th time, next try in {self.sleep_ping_loop} seconds if threshold not met"
                 )
@@ -511,6 +518,17 @@ class ElectrumSocket:
                         f"More than {self.tries_threshold} Ping failures for {self.tries_threshold * self.sleep_ping_loop} seconds, Giving up!"
                     )
                     return  # will end the thread
+            except Exception as e:
+                tries += 1
+                logger.error(
+                    f"Error in ping-loop ({tries}th time): {e.__class__.__name__}: {e}"
+                )
+                if tries > self.tries_threshold:
+                    logger.error(
+                        f"More than {self.tries_threshold} Ping failures for {self.tries_threshold * self.sleep_ping_loop} seconds, Giving up!"
+                    )
+                    return
+            time.sleep(self.sleep_ping_loop)
 
     def _notify_loop(self):
         while self.running:
@@ -530,7 +548,7 @@ class ElectrumSocket:
         else:
             logger.debug("Notification:", data)
 
-    def call(self, method, params=[]) -> dict:
+    def call(self, method, params=None) -> dict:
         """
         Calls a method on the Electrum server and returns the response.
 
@@ -545,12 +563,26 @@ class ElectrumSocket:
         might raise a ElSockTimeoutException if self._call_timeout is over
 
         """
+        if params is None:
+            params = []
         uid = random.randint(0, 1 << 32)
         obj = {"jsonrpc": "2.0", "method": method, "params": params, "id": uid}
         self._requests.append(obj)
         start = time.time()
 
         while uid not in self._results:  # wait for response
+            if not self.running:
+                raise ElSockTimeoutException(
+                    f"ElectrumSocket stopped while waiting for {method} on {self._socket}"
+                )
+            if self.is_socket_closed():
+                raise ElSockTimeoutException(
+                    f"Socket closed while waiting for {method} on {self._socket}"
+                )
+            if hasattr(self, "_recv_thread") and self._recv_thread and not self._recv_thread.is_alive():
+                raise ElSockTimeoutException(
+                    f"recv thread not alive while waiting for {method} on {self._socket}"
+                )
             # time.sleep(1)
             time.sleep(0.01)
             if time.time() - start > self._call_timeout:
@@ -559,7 +591,15 @@ class ElectrumSocket:
                 )
         res = self._results.pop(uid)
         if "error" in res:
-            raise ValueError(res["error"])
+            err = res["error"]
+            # electrs can respond with this while still indexing; treat as a transient condition
+            if isinstance(err, dict) and "message" in err and "unavailable index" in str(
+                err.get("message")
+            ):
+                raise ElSockTimeoutException(
+                    f"Electrum server temporarily unavailable for {method}: {err}"
+                )
+            raise ValueError(err)
         if "result" in res:
             return res["result"]
 

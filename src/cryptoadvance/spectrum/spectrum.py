@@ -128,16 +128,21 @@ class Spectrum:
         # 143 - Testnet, 110 - Mainnet, 195 - Liquid
         self.t0 = time.time()  # for uptime
         if self.sock and self.sock.status == "ok":
-            logger.info(f"Pinged electrum in {self.sock.ping()} ")
-            logger.info("subscribe to block headers")
-            res = self.sock.call("blockchain.headers.subscribe")
-            self.blocks = res["height"]
-            self.bestblockhash = get_blockhash(res["hex"])
-            logger.info("detect chain from header")
-            rootheader = self.sock.call("blockchain.block.header", [0])
-            logger.info(f"Set roothash {self.roothash}")
-            self.roothash = get_blockhash(rootheader)
-            self.chain = ROOT_HASHES.get(self.roothash, "regtest")
+            try:
+                logger.info(f"Pinged electrum in {self.sock.ping()} ")
+                logger.info("subscribe to block headers")
+                res = self.sock.call("blockchain.headers.subscribe")
+                self.blocks = res["height"]
+                self.bestblockhash = get_blockhash(res["hex"])
+                logger.info("detect chain from header")
+                rootheader = self.sock.call("blockchain.block.header", [0])
+                logger.info(f"Set roothash {self.roothash}")
+                self.roothash = get_blockhash(rootheader)
+                self.chain = ROOT_HASHES.get(self.roothash, "regtest")
+            except Exception as e:
+                logger.info(
+                    f"Electrum not ready during startup (may still be indexing): {e}"
+                )
 
     def stop(self):
         logger.info("Stopping Spectrum")
@@ -186,6 +191,7 @@ class Spectrum:
                 logger.info("Syncprocess not starting, already running!")
                 return
             self._sync_in_progress = True
+            self.sync_speed = 0
 
             subscription_logging_counter = 0
             # subscribe to all scripts
@@ -201,9 +207,8 @@ class Spectrum:
                     continue
                 subscription_logging_counter += 1
                 if subscription_logging_counter % 100 == 0:
-                    self.sync_speed = subscription_logging_counter / int(
-                        (datetime.now() - ts).total_seconds()
-                    )
+                    elapsed_s = max((datetime.now() - ts).total_seconds(), 0.001)
+                    self.sync_speed = subscription_logging_counter / elapsed_s
                     self.progress_percent = int(
                         subscription_logging_counter / all_scripts_len * 100
                     )
@@ -226,7 +231,7 @@ class Spectrum:
             self.progress_percent = 100
             ts_diff_s = int((datetime.now() - ts).total_seconds())
             logger.info(
-                f"Syncprocess finished syncing {all_scripts_len} scripts in {ts_diff_s} with {self.sync_speed} scripts/s)"
+                f"Syncprocess finished syncing {all_scripts_len} scripts in {ts_diff_s} with {getattr(self, 'sync_speed', 0)} scripts/s)"
             )
         except Exception as e:
             logger.exception(e)
