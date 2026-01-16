@@ -1,5 +1,6 @@
 import logging
 import time
+import threading
 from unittest.mock import MagicMock
 
 from flask import Flask
@@ -9,6 +10,32 @@ from embit.descriptor.checksum import add_checksum
 from embit.bip32 import NETWORKS
 
 logger = logging.getLogger("cryptoadvance")
+
+
+def test_chain_detection_uses_server_features_genesis_hash():
+    spectrum = Spectrum.__new__(Spectrum)
+    spectrum.roothash = ""
+    spectrum.chain = "regtest"
+    spectrum._chain_detection_lock = threading.Lock()
+    spectrum._last_chain_detection_attempt_ts = 0.0
+
+    sock = MagicMock()
+    sock.status = "ok"
+
+    def fake_call(method, params=None):
+        if method == "server.features":
+            return {
+                "genesis_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+            }
+        raise AssertionError(f"Unexpected electrum call: {method}")
+
+    sock.call = fake_call
+    spectrum.sock = sock
+
+    spectrum._maybe_detect_chain(force=True)
+
+    assert spectrum.chain == "main"
+    assert spectrum.roothash == "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
 
 def test_importdescriptor(app: Flask, rootkey_hold_accident, acc0key0addr_hold_accident):
     ''' THis does:

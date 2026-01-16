@@ -74,6 +74,7 @@ ROOT_HASHES = {
     "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f": "main",
     "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943": "test",
     "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6": "signet",
+    "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206": "regtest",
     # anything else is regtest
 }
 
@@ -100,6 +101,8 @@ class Spectrum:
         self.proxy_url = proxy_url
         assert type(ssl) == bool, f"ssl is of type {type(ssl)}"
         self.datadir = datadir
+        self._chain_detection_lock = threading.Lock()
+        self._last_chain_detection_attempt_ts = 0.0
         if not os.path.exists(self.txdir):
             logger.info(f"Creating txdir {self.txdir} ")
             os.makedirs(self.txdir)
@@ -124,13 +127,55 @@ class Spectrum:
                 res = self.sock.call("blockchain.headers.subscribe")
                 self.blocks = res["height"]
                 self.bestblockhash = get_blockhash(res["hex"])
-                logger.info("detect chain from header")
-                rootheader = self.sock.call("blockchain.block.header", [0])
-                logger.info(f"Set roothash {self.roothash}")
-                self.roothash = get_blockhash(rootheader)
-                self.chain = ROOT_HASHES.get(self.roothash, "regtest")
+                self._maybe_detect_chain(force=True)
             except Exception as e:
                 logger.error(f"Electrum not ready during startup: {e}")
+
+    def _maybe_detect_chain(self, force: bool = False) -> None:
+        """Best-effort chain detection.
+
+        Important: startup can happen while electrs is still indexing.
+        In that case we must not permanently stick to the default (regtest);
+        instead we retry later on demand.
+        """
+        if not force and self.roothash:
+            return
+        if not self.sock or self.sock.status != "ok":
+            return
+
+        now = time.time()
+        # throttle retries to avoid spamming electrs while it's indexing
+        if not force and now - self._last_chain_detection_attempt_ts < 10:
+            return
+
+        with self._chain_detection_lock:
+            now = time.time()
+            if not force and now - self._last_chain_detection_attempt_ts < 10:
+                return
+            self._last_chain_detection_attempt_ts = now
+
+            try:
+                features = self.sock.call("server.features")
+                genesis_hash = None
+                if isinstance(features, dict):
+                    genesis_hash = features.get("genesis_hash")
+                if isinstance(genesis_hash, str) and len(genesis_hash) == 64:
+                    chain = ROOT_HASHES.get(genesis_hash, "regtest")
+                    self.roothash = genesis_hash
+                    self.chain = chain
+                    logger.info(f"Detected chain={self.chain} from server.features")
+                    return
+            except Exception:
+                # Fallback to header-based detection below.
+                pass
+
+            try:
+                rootheader = self.sock.call("blockchain.block.header", [0])
+                self.roothash = get_blockhash(rootheader)
+                self.chain = ROOT_HASHES.get(self.roothash, "regtest")
+                logger.info(f"Detected chain={self.chain} from genesis header")
+            except Exception as e:
+                logger.info(f"Chain detection not available yet: {e}")
 
     def stop(self):
         logger.info("Stopping Spectrum")
@@ -431,6 +476,7 @@ class Spectrum:
 
     @property
     def network(self):
+        self._maybe_detect_chain()
         return NETWORKS.get(self.chain, NETWORKS["main"])
 
     def process_notification(self, data):
@@ -520,6 +566,7 @@ class Spectrum:
 
     @rpc
     def getblockchaininfo(self):
+        self._maybe_detect_chain()
         return {
             "chain": self.chain,
             "blocks": self.blocks,
@@ -602,6 +649,7 @@ class Spectrum:
 
     @rpc
     def getblockhash(self, height):
+        self._maybe_detect_chain()
         if height == 0:
             return self.roothash
         if height == self.blocks:
