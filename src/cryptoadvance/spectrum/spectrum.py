@@ -25,6 +25,7 @@ from sqlalchemy.sql import func
 
 from .db import UTXO, Descriptor, Script, Tx, TxCategory, Wallet, db
 from .elsock import ElectrumSocket, ElSockTimeoutException
+from .spectrum_error import RPCError
 from .util import (
     FlaskThread,
     SpectrumException,
@@ -66,17 +67,6 @@ def walletrpc(f):
         return f(*args, **kwargs)
 
     return wrapper
-
-
-class RPCError(Exception):
-    """Should use one of : https://github.com/bitcoin/bitcoin/blob/v22.0/src/rpc/protocol.h#L25-L88"""
-
-    def __init__(self, message, code=-1):  # -1 is RPC_MISC_ERROR
-        self.message = message
-        self.code = code
-
-    def to_dict(self):
-        return {"code": self.code, "message": self.message}
 
 
 # we detect chain by looking at the hash of the 0th block
@@ -140,9 +130,7 @@ class Spectrum:
                 self.roothash = get_blockhash(rootheader)
                 self.chain = ROOT_HASHES.get(self.roothash, "regtest")
             except Exception as e:
-                logger.info(
-                    f"Electrum not ready during startup (may still be indexing): {e}"
-                )
+                logger.error(f"Electrum not ready during startup: {e}")
 
     def stop(self):
         logger.info("Stopping Spectrum")
